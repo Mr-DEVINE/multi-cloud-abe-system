@@ -1,3 +1,4 @@
+from storage import storage_manager
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -69,22 +70,23 @@ async def encrypt_and_upload(
     file: UploadFile = File(...), 
     policy: str = Form(...)
 ):
-    """Encrypts file with ABE Simulation and stores it"""
     try:
-        # 1. Read the uploaded file
         file_bytes = await file.read()
         
-        # 2. Generate a key and encrypt (Simulating ABE Encryption)
+        # 1. Encrypt with ABE Simulation
         file_key = ABESimulator.generate_master_key()
         encrypted_data = ABESimulator.encrypt_file(file_bytes, file_key)
         
-        # 3. Save metadata and encrypted file to our mock database
+        # 2. Assign an ID and Split/Upload to Multi-Cloud
         file_id = f"file_{len(mock_database['files']) + 1}"
+        chunk_metadata = storage_manager.split_and_upload(file_id, encrypted_data)
+        
+        # 3. Save metadata (No longer saving the actual file here!)
         mock_database["files"][file_id] = {
             "filename": file.filename,
             "policy": policy,
-            "key": file_key, # In strict ABE, this key is embedded mathematically
-            "encrypted_content": encrypted_data # We will split this for multi-cloud later
+            "key": file_key,
+            "chunks": chunk_metadata # Store the map of where the pieces are
         }
         
         return {
@@ -92,16 +94,13 @@ async def encrypt_and_upload(
             "file_id": file_id,
             "filename": file.filename,
             "policy_applied": policy,
-            "message": "File encrypted securely."
+            "message": "File encrypted, split, and distributed to multi-cloud successfully."
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Encryption failed: {str(e)}")
 
 @app.post("/download-and-decrypt")
 async def download_and_decrypt(file_id: str, user_id: str):
-    """Evaluates the access policy and decrypts the file if allowed"""
-    
-    # Check if the requested file and user exist in our system
     if file_id not in mock_database["files"]:
         raise HTTPException(status_code=404, detail="File not found")
     if user_id not in mock_database["users"]:
@@ -110,27 +109,29 @@ async def download_and_decrypt(file_id: str, user_id: str):
     file_record = mock_database["files"][file_id]
     user_attributes = mock_database["users"][user_id]
     
-    # 1. Evaluate the Policy (The core Attribute-Based logic)
+    # 1. Evaluate the ABE Policy
     has_access = ABESimulator.evaluate_policy(file_record["policy"], user_attributes)
     
     if not has_access:
         raise HTTPException(
             status_code=403, 
-            detail=f"Access Denied: User attributes {user_attributes} do not satisfy the policy '{file_record['policy']}'."
+            detail=f"Access Denied: User attributes {user_attributes} do not satisfy the policy."
         )
         
-    # 2. If access is granted, decrypt the file
+    # 2. Access Granted -> Fetch chunks from clouds and reconstruct
     try:
-        decrypted_data = ABESimulator.decrypt_file(file_record["encrypted_content"], file_record["key"])
+        reconstructed_encrypted_data = storage_manager.download_and_reconstruct(file_id, file_record["chunks"])
+        
+        # 3. Decrypt the reconstructed file
+        decrypted_data = ABESimulator.decrypt_file(reconstructed_encrypted_data, file_record["key"])
         
         return {
             "status": "success",
-            "message": "Access Granted. File Decrypted.",
+            "message": "File successfully fetched from AWS, Azure, & GCP, reconstructed, and decrypted.",
             "filename": file_record["filename"],
             "original_size_bytes": len(decrypted_data)
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Decryption failed: {str(e)}")
-
+        raise HTTPException(status_code=500, detail=f"Download/Decryption failed: {str(e)}")
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
