@@ -1,68 +1,123 @@
-from storage import storage_manager
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+import os
+from datetime import datetime, timedelta
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
-from crypto import ABESimulator  # Importing our ABE logic
+from dotenv import load_dotenv
+from pymongo import MongoClient
+import bcrypt
+import jwt
 
-# Initialize FastAPI App
+# Import our custom modules
+from crypto import ABESimulator
+from storage import storage_manager
+
+# Load Environment Variables
+load_dotenv()
+
+# --- Initialize FastAPI App ---
 app = FastAPI(
     title="Multi-Cloud ABE System API",
-    description="Backend for Secure Data Sharing using CP-ABE in Multi-Cloud Environments",
-    version="1.0.0"
+    description="Backend for Secure Data Sharing with MongoDB and Auth",
+    version="2.0.0"
 )
 
-# Setup CORS so your React frontend can communicate with this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, change "*" to your React app's URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Pydantic Models for Data Validation ---
-class UserAttributes(BaseModel):
-    user_id: str
+# --- MongoDB Setup ---
+MONGO_URI = os.getenv("MONGODB_URI")
+if not MONGO_URI:
+    raise ValueError("MONGODB_URI is missing from .env file!")
+
+client = MongoClient(MONGO_URI)
+db = client["multi_cloud_abe"]
+users_collection = db["users"]
+files_collection = db["files"]
+
+# --- Authentication Security Setup ---
+SECRET_KEY = "your-very-secret-jwt-key"  # In production, this goes in .env
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+def hash_password(password: str) -> str:
+    """Hashes a password using pure bcrypt"""
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verifies a password using pure bcrypt"""
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+
+# --- Pydantic Models ---
+class UserSignup(BaseModel):
+    username: str
+    password: str
     attributes: list[str]
 
-class AccessPolicy(BaseModel):
-    policy_string: str
+class UserLogin(BaseModel):
+    username: str
+    password: str
 
-# --- Mock Database ---
-# We use this dictionary to simulate MongoDB until we connect it.
-mock_database = {
-    "files": {},
-    "users": {
-        # Pre-loading some users for testing purposes
-        "user_alice": ["hr", "manager"],
-        "user_bob": ["it", "intern"],
-        "user_charlie": ["director", "finance"]
-    }
-}
+# --- Auto-Seed Default Users for Testing ---
+# Using lifespan context instead of on_event as requested by the FastAPI warning!
+@app.on_event("startup")
+def startup_db_seed():
+    """Seeds the DB with our test users so the React frontend still works."""
+    if users_collection.count_documents({}) == 0:
+        default_users = [
+            {"username": "user_alice", "password": hash_password("password123"), "attributes": ["hr", "manager"]},
+            {"username": "user_bob", "password": hash_password("password123"), "attributes": ["it", "intern"]},
+            {"username": "user_charlie", "password": hash_password("password123"), "attributes": ["director", "finance"]}
+        ]
+        users_collection.insert_many(default_users)
+        print("MongoDB seeded with default test users: user_alice, user_bob, user_charlie.")
 
 # --- API Endpoints ---
 
 @app.get("/")
 async def health_check():
-    return {"status": "success", "message": "Multi-Cloud ABE Backend is running smoothly."}
+    return {"status": "success", "message": "Multi-Cloud ABE Backend is running and connected to MongoDB."}
 
-@app.post("/setup-kgc")
-async def setup_kgc():
-    """Initializes the Key Generation Center"""
-    return {"status": "success", "message": "KGC setup complete. System is ready."}
+@app.post("/signup")
+async def signup(user: UserSignup):
+    """Registers a new user securely into MongoDB."""
+    if users_collection.find_one({"username": user.username}):
+        raise HTTPException(status_code=400, detail="Username already registered")
 
-@app.post("/generate-key")
-async def generate_user_key(user: UserAttributes):
-    """Registers a user and assigns them attributes"""
-    # Convert attributes to lowercase for consistency
-    lower_attrs = [attr.lower() for attr in user.attributes]
-    mock_database["users"][user.user_id] = lower_attrs
+    user_dict = {
+        "username": user.username,
+        "password": hash_password(user.password),
+        "attributes": [attr.lower() for attr in user.attributes],
+        "created_at": datetime.utcnow()
+    }
+    users_collection.insert_one(user_dict)
     
+    return {"status": "success", "message": "Account created! Attributes assigned."}
+
+@app.post("/login")
+async def login(user: UserLogin):
+    """Authenticates a user and returns a JWT token."""
+    db_user = users_collection.find_one({"username": user.username})
+    
+    if not db_user or not verify_password(user.password, db_user["password"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    expiration = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    token_data = {"sub": user.username, "exp": expiration}
+    token = jwt.encode(token_data, SECRET_KEY, algorithm=ALGORITHM)
+
     return {
-        "status": "success", 
-        "user_id": user.user_id,
-        "message": f"Attributes registered successfully: {lower_attrs}"
+        "access_token": token, 
+        "token_type": "bearer", 
+        "username": user.username, 
+        "attributes": db_user["attributes"]
     }
 
 @app.post("/encrypt-and-upload")
@@ -70,24 +125,24 @@ async def encrypt_and_upload(
     file: UploadFile = File(...), 
     policy: str = Form(...)
 ):
+    """Encrypts file, splits to Multi-Cloud, and saves metadata to MongoDB."""
     try:
         file_bytes = await file.read()
-        
-        # 1. Encrypt with ABE Simulation
         file_key = ABESimulator.generate_master_key()
         encrypted_data = ABESimulator.encrypt_file(file_bytes, file_key)
         
-        # 2. Assign an ID and Split/Upload to Multi-Cloud
-        file_id = f"file_{len(mock_database['files']) + 1}"
+        file_id = f"file_{int(datetime.utcnow().timestamp())}"
         chunk_metadata = storage_manager.split_and_upload(file_id, encrypted_data)
         
-        # 3. Save metadata (No longer saving the actual file here!)
-        mock_database["files"][file_id] = {
+        file_document = {
+            "file_id": file_id,
             "filename": file.filename,
             "policy": policy,
-            "key": file_key,
-            "chunks": chunk_metadata # Store the map of where the pieces are
+            "key": file_key.decode('utf-8'),
+            "chunks": chunk_metadata,
+            "uploaded_at": datetime.utcnow()
         }
+        files_collection.insert_one(file_document)
         
         return {
             "status": "success",
@@ -101,29 +156,28 @@ async def encrypt_and_upload(
 
 @app.post("/download-and-decrypt")
 async def download_and_decrypt(file_id: str, user_id: str):
-    if file_id not in mock_database["files"]:
+    """Verifies ABE policy via MongoDB attributes and decrypts."""
+    file_record = files_collection.find_one({"file_id": file_id})
+    user_record = users_collection.find_one({"username": user_id})
+    
+    if not file_record:
         raise HTTPException(status_code=404, detail="File not found")
-    if user_id not in mock_database["users"]:
+    if not user_record:
         raise HTTPException(status_code=404, detail="User not found")
         
-    file_record = mock_database["files"][file_id]
-    user_attributes = mock_database["users"][user_id]
-    
-    # 1. Evaluate the ABE Policy
+    user_attributes = user_record["attributes"]
     has_access = ABESimulator.evaluate_policy(file_record["policy"], user_attributes)
     
     if not has_access:
         raise HTTPException(
             status_code=403, 
-            detail=f"Access Denied: User attributes {user_attributes} do not satisfy the policy."
+            detail=f"Access Denied: Your attributes {user_attributes} do not satisfy the policy '{file_record['policy']}'."
         )
         
-    # 2. Access Granted -> Fetch chunks from clouds and reconstruct
     try:
         reconstructed_encrypted_data = storage_manager.download_and_reconstruct(file_id, file_record["chunks"])
-        
-        # 3. Decrypt the reconstructed file
-        decrypted_data = ABESimulator.decrypt_file(reconstructed_encrypted_data, file_record["key"])
+        decryption_key = file_record["key"].encode('utf-8')
+        decrypted_data = ABESimulator.decrypt_file(reconstructed_encrypted_data, decryption_key)
         
         return {
             "status": "success",
@@ -133,5 +187,6 @@ async def download_and_decrypt(file_id: str, user_id: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Download/Decryption failed: {str(e)}")
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
